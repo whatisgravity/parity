@@ -81,6 +81,7 @@ mod account;
 mod blockchain;
 mod presale;
 mod run;
+#[cfg(feature="ipc")]
 mod sync;
 mod snapshot;
 
@@ -116,10 +117,24 @@ fn start() -> Result<String, String> {
 	execute(cmd)
 }
 
-fn main() {
+#[cfg(not(feature="ipc"))]
+fn sync_main() -> bool {
+	false
+}
+
+#[cfg(feature="ipc")]
+fn sync_main() -> bool {
 	// just redirect to the sync::main()
 	if std::env::args().nth(1).map_or(false, |arg| arg == "sync") {
 		sync::main();
+		true
+	} else {
+		false
+	}
+}
+
+fn main() {
+	if sync_main() {
 		return;
 	}
 

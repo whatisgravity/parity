@@ -89,11 +89,14 @@ pub fn main() {
 	let remote_client = nanoipc::init_client::<RemoteClient<_>>(
 		&service_urls::with_base(&service_config.io_path, service_urls::CLIENT),
 	).unwrap();
+	let snapshot_client = nanoipc::init_client::<RemoteSnapshotService<_>>(
+		&service_urls::with_base(&service_config.io_path, service_urls::SNAPSHOT),
+	).unwrap();
 
 	remote_client.handshake().unwrap();
 
 	let stop = Arc::new(AtomicBool::new(false));
-	let sync = EthSync::new(service_config.sync, remote_client.service().clone(), service_config.net).unwrap();
+	let sync = EthSync::new(service_config.sync, remote_client.service().clone(), snapshot_client.service().clone(), service_config.net).unwrap();
 
 	run_service(
 		&service_urls::with_base(&service_config.io_path, service_urls::SYNC),
