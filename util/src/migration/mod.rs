@@ -220,7 +220,7 @@ impl Manager {
 		let old_path_str = try!(old_path.to_str().ok_or(Error::MigrationImpossible));
 		let mut cur_db = try!(Database::open(&db_config, old_path_str).map_err(Error::Custom));
 
-		for migration in migrations.iter_mut() {
+		for migration in migrations {
 			// Change number of columns in new db
 			let current_columns = db_config.columns;
 			db_config.columns = migration.columns();
