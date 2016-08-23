@@ -903,7 +903,7 @@ impl ChainSync {
 	/// Called when a new peer is connected
 	pub fn on_peer_connected(&mut self, io: &mut SyncIo, peer: PeerId) {
 		trace!(target: "sync", "== Connected {}: {}", peer, io.peer_info(peer));
-		if let Err(e) = self.send_status(io) {
+		if let Err(e) = self.send_status(io, peer) {
 			debug!(target:"sync", "Error sending status request: {:?}", e);
 			io.disable_peer(peer);
 		}
@@ -1275,14 +1275,22 @@ impl ChainSync {
 	}
 
 	/// Send Status message
-	fn send_status(&mut self, io: &mut SyncIo) -> Result<(), NetworkError> {
-		let mut packet = RlpStream::new_list(5);
+	fn send_status(&mut self, io: &mut SyncIo, peer: PeerId) -> Result<(), NetworkError> {
+		let pv64 = io.eth_protocol_version(peer) >= 64;
+		let mut packet = RlpStream::new_list(if pv64 { 7 } else { 5 });
 		let chain = io.chain().chain_info();
 		packet.append(&(PROTOCOL_VERSION as u32));
 		packet.append(&self.network_id);
 		packet.append(&chain.total_difficulty);
 		packet.append(&chain.best_block_hash);
 		packet.append(&chain.genesis_hash);
+		if pv64 {
+			let manifest = self.snapshot_service.manifest();
+			let block_number = manifest.as_ref().map_or(0, |m| m.block_number);
+			let manifest_hash = manifest.map_or(H256::new(), |m| m.into_rlp().sha3());
+			packet.append(&manifest_hash);
+			packet.append(&block_number);
+		}
 		io.respond(STATUS_PACKET, packet.out())
 	}
 
@@ -1776,6 +1784,7 @@ impl ChainSync {
 #[cfg(test)]
 mod tests {
 	use tests::helpers::*;
+	use tests::snapshot::TestSnapshotService;
 	use super::*;
 	use ::SyncConfig;
 	use util::*;
@@ -1828,7 +1837,8 @@ mod tests {
 	fn return_receipts_empty() {
 		let mut client = TestBlockChainClient::new();
 		let mut queue = VecDeque::new();
-		let io = TestIo::new(&mut client, &mut queue, None);
+		let mut ss = TestSnapshotService::new();
+		let io = TestIo::new(&mut client, &mut ss, &mut queue, None);
 
 		let result = ChainSync::return_receipts(&io, &UntrustedRlp::new(&[0xc0]), 0);
 
@@ -1840,7 +1850,8 @@ mod tests {
 		let mut client = TestBlockChainClient::new();
 		let mut queue = VecDeque::new();
 		let sync = dummy_sync_with_peer(H256::new(), &client);
-		let mut io = TestIo::new(&mut client, &mut queue, None);
+		let mut ss = TestSnapshotService::new();
+		let mut io = TestIo::new(&mut client, &mut ss, &mut queue, None);
 
 		let mut receipt_list = RlpStream::new_list(4);
 		receipt_list.append(&H256::from("0000000000000000000000000000000000000000000000005555555555555555"));
@@ -1895,7 +1906,8 @@ mod tests {
 		let hashes: Vec<_> = headers.iter().map(|h| HeaderView::new(h).sha3()).collect();
 
 		let mut queue = VecDeque::new();
-		let io = TestIo::new(&mut client, &mut queue, None);
+		let mut ss = TestSnapshotService::new();
+		let io = TestIo::new(&mut client, &mut ss, &mut queue, None);
 
 		let unknown: H256 = H256::new();
 		let result = ChainSync::return_block_headers(&io, &UntrustedRlp::new(&make_hash_req(&unknown, 1, 0, false)), 0);
@@ -1933,7 +1945,8 @@ mod tests {
 		let mut client = TestBlockChainClient::new();
 		let mut queue = VecDeque::new();
 		let sync = dummy_sync_with_peer(H256::new(), &client);
-		let mut io = TestIo::new(&mut client, &mut queue, None);
+		let mut ss = TestSnapshotService::new();
+		let mut io = TestIo::new(&mut client, &mut ss, &mut queue, None);
 
 		let mut node_list = RlpStream::new_list(3);
 		node_list.append(&H256::from("0000000000000000000000000000000000000000000000005555555555555555"));
@@ -1958,7 +1971,8 @@ mod tests {
 	}
 
 	fn dummy_sync_with_peer(peer_latest_hash: H256, client: &BlockChainClient) -> ChainSync {
-		let mut sync = ChainSync::new(SyncConfig::default(), client);
+		let ss = Arc::new(TestSnapshotService::new());
+		let mut sync = ChainSync::new(SyncConfig::default(), client, ss);
 		sync.peers.insert(0,
 			PeerInfo {
 				protocol_version: 0,
@@ -1973,6 +1987,9 @@ mod tests {
 				ask_time: 0f64,
 				expired: false,
 				confirmation: super::ForkConfirmation::Confirmed,
+				snapshot_number: None,
+				snapshot_hash: None,
+				asking_snapshot_data: None,
 			});
 		sync
 	}
@@ -1984,7 +2001,8 @@ mod tests {
 		let mut queue = VecDeque::new();
 		let mut sync = dummy_sync_with_peer(client.block_hash_delta_minus(10), &client);
 		let chain_info = client.chain_info();
-		let io = TestIo::new(&mut client, &mut queue, None);
+		let mut ss = TestSnapshotService::new();
+		let io = TestIo::new(&mut client, &mut ss, &mut queue, None);
 
 		let lagging_peers = sync.get_lagging_peers(&chain_info, &io);
 
@@ -2015,7 +2033,8 @@ mod tests {
 		let mut queue = VecDeque::new();
 		let mut sync = dummy_sync_with_peer(client.block_hash_delta_minus(5), &client);
 		let chain_info = client.chain_info();
-		let mut io = TestIo::new(&mut client, &mut queue, None);
+		let mut ss = TestSnapshotService::new();
+		let mut io = TestIo::new(&mut client, &mut ss, &mut queue, None);
 
 		let peers = sync.get_lagging_peers(&chain_info, &io);
 		let peer_count = sync.propagate_new_hashes(&chain_info, &mut io, &peers);
@@ -2035,7 +2054,8 @@ mod tests {
 		let mut queue = VecDeque::new();
 		let mut sync = dummy_sync_with_peer(client.block_hash_delta_minus(5), &client);
 		let chain_info = client.chain_info();
-		let mut io = TestIo::new(&mut client, &mut queue, None);
+		let mut ss = TestSnapshotService::new();
+		let mut io = TestIo::new(&mut client, &mut ss, &mut queue, None);
 		let peers = sync.get_lagging_peers(&chain_info, &io);
 		let peer_count = sync.propagate_blocks(&chain_info, &mut io, &[], &peers);
 
@@ -2055,7 +2075,8 @@ mod tests {
 		let hash = client.block_hash(BlockID::Number(99)).unwrap();
 		let mut sync = dummy_sync_with_peer(client.block_hash_delta_minus(5), &client);
 		let chain_info = client.chain_info();
-		let mut io = TestIo::new(&mut client, &mut queue, None);
+		let mut ss = TestSnapshotService::new();
+		let mut io = TestIo::new(&mut client, &mut ss, &mut queue, None);
 		let peers = sync.get_lagging_peers(&chain_info, &io);
 		let peer_count = sync.propagate_blocks(&chain_info, &mut io, &[hash.clone()], &peers);
 
@@ -2077,7 +2098,8 @@ mod tests {
 		let mut queue = VecDeque::new();
 		let mut sync = dummy_sync_with_peer(client.block_hash_delta_minus(5), &client);
 		//sync.have_common_block = true;
-		let mut io = TestIo::new(&mut client, &mut queue, None);
+		let mut ss = TestSnapshotService::new();
+		let mut io = TestIo::new(&mut client, &mut ss, &mut queue, None);
 
 		let block = UntrustedRlp::new(&block_data);
 
@@ -2095,7 +2117,8 @@ mod tests {
 
 		let mut queue = VecDeque::new();
 		let mut sync = dummy_sync_with_peer(client.block_hash_delta_minus(5), &client);
-		let mut io = TestIo::new(&mut client, &mut queue, None);
+		let mut ss = TestSnapshotService::new();
+		let mut io = TestIo::new(&mut client, &mut ss, &mut queue, None);
 
 		let block = UntrustedRlp::new(&block_data);
 
@@ -2110,7 +2133,8 @@ mod tests {
 		client.add_blocks(10, EachBlockWith::Uncle);
 		let mut queue = VecDeque::new();
 		let mut sync = dummy_sync_with_peer(client.block_hash_delta_minus(5), &client);
-		let mut io = TestIo::new(&mut client, &mut queue, None);
+		let mut ss = TestSnapshotService::new();
+		let mut io = TestIo::new(&mut client, &mut ss, &mut queue, None);
 
 		let empty_data = vec![];
 		let block = UntrustedRlp::new(&empty_data);
@@ -2126,7 +2150,8 @@ mod tests {
 		client.add_blocks(10, EachBlockWith::Uncle);
 		let mut queue = VecDeque::new();
 		let mut sync = dummy_sync_with_peer(client.block_hash_delta_minus(5), &client);
-		let mut io = TestIo::new(&mut client, &mut queue, None);
+		let mut ss = TestSnapshotService::new();
+		let mut io = TestIo::new(&mut client, &mut ss, &mut queue, None);
 
 		let hashes_data = get_dummy_hashes();
 		let hashes_rlp = UntrustedRlp::new(&hashes_data);
@@ -2142,7 +2167,8 @@ mod tests {
 		client.add_blocks(10, EachBlockWith::Uncle);
 		let mut queue = VecDeque::new();
 		let mut sync = dummy_sync_with_peer(client.block_hash_delta_minus(5), &client);
-		let mut io = TestIo::new(&mut client, &mut queue, None);
+		let mut ss = TestSnapshotService::new();
+		let mut io = TestIo::new(&mut client, &mut ss, &mut queue, None);
 
 		let empty_hashes_data = vec![];
 		let hashes_rlp = UntrustedRlp::new(&empty_hashes_data);
@@ -2161,7 +2187,8 @@ mod tests {
 		let mut queue = VecDeque::new();
 		let mut sync = dummy_sync_with_peer(client.block_hash_delta_minus(5), &client);
 		let chain_info = client.chain_info();
-		let mut io = TestIo::new(&mut client, &mut queue, None);
+		let mut ss = TestSnapshotService::new();
+		let mut io = TestIo::new(&mut client, &mut ss, &mut queue, None);
 
 		let peers = sync.get_lagging_peers(&chain_info, &io);
 		sync.propagate_new_hashes(&chain_info, &mut io, &peers);
@@ -2180,7 +2207,8 @@ mod tests {
 		let mut queue = VecDeque::new();
 		let mut sync = dummy_sync_with_peer(client.block_hash_delta_minus(5), &client);
 		let chain_info = client.chain_info();
-		let mut io = TestIo::new(&mut client, &mut queue, None);
+		let mut ss = TestSnapshotService::new();
+		let mut io = TestIo::new(&mut client, &mut ss, &mut queue, None);
 
 		let peers = sync.get_lagging_peers(&chain_info, &io);
 		sync.propagate_blocks(&chain_info, &mut io, &[], &peers);
@@ -2214,7 +2242,8 @@ mod tests {
 		// when
 		{
 			let mut queue = VecDeque::new();
-			let mut io = TestIo::new(&mut client, &mut queue, None);
+			let mut ss = TestSnapshotService::new();
+			let mut io = TestIo::new(&mut client, &mut ss, &mut queue, None);
 			io.chain.miner.chain_new_blocks(io.chain, &[], &[], &[], &good_blocks);
 			sync.chain_new_blocks(&mut io, &[], &[], &[], &good_blocks, &[]);
 			assert_eq!(io.chain.miner.status().transactions_in_future_queue, 0);
@@ -2228,7 +2257,8 @@ mod tests {
 		}
 		{
 			let mut queue = VecDeque::new();
-			let mut io = TestIo::new(&mut client, &mut queue, None);
+			let mut ss = TestSnapshotService::new();
+			let mut io = TestIo::new(&mut client, &mut ss, &mut queue, None);
 			io.chain.miner.chain_new_blocks(io.chain, &[], &[], &good_blocks, &retracted_blocks);
 			sync.chain_new_blocks(&mut io, &[], &[], &good_blocks, &retracted_blocks, &[]);
 		}
@@ -2252,7 +2282,8 @@ mod tests {
 		let retracted_blocks = vec![client.block_hash_delta_minus(1)];
 
 		let mut queue = VecDeque::new();
-		let mut io = TestIo::new(&mut client, &mut queue, None);
+		let mut ss = TestSnapshotService::new();
+		let mut io = TestIo::new(&mut client, &mut ss, &mut queue, None);
 
 		// when
 		sync.chain_new_blocks(&mut io, &[], &[], &[], &good_blocks, &[]);
